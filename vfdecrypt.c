@@ -35,10 +35,16 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdint.h>
+
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1070
+#include <CommonCrypto/CommonCrypto.h>
+#else
 #include <openssl/sha.h>
 #include <openssl/aes.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
+#endif
+
 #include <byteswap.h>
 
 #define OSSwapHostToBigInt32(x) bswap_32(x)
@@ -187,9 +193,15 @@ void adjust_v2_header_byteorder(cencrypted_v2_pwheader *pwhdr) {
   pwhdr->encrypted_keyblob_size = htonl(pwhdr->encrypted_keyblob_size);
 }
 
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1070
+CCHmacContext hmacsha1_ctx;
+void *aes_decrypt_key;
+int CHUNK_SIZE=512;  // default
+#else
 HMAC_CTX hmacsha1_ctx;
 AES_KEY aes_decrypt_key;
 int CHUNK_SIZE=4096;  // default
+#endif
 
 /**
  * Compute IV of current block as
@@ -200,33 +212,135 @@ void compute_iv(uint32_t chunk_no, uint8_t *iv) {
   unsigned int mdLen,i;
 
   chunk_no = OSSwapHostToBigInt32(chunk_no);
+
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1070
+  CCHmacInit(&hmacsha1_ctx, kCCHmacAlgSHA1, NULL, 0);
+  CCHmacUpdate(&hmacsha1_ctx, (const void *)&chunk_no, sizeof(uint32_t));
+  CCHmacFinal(&hmacsha1_ctx, mdResult);
+
+  if (mdResult != NULL)
+  {
+    mdLen = 20;
+  } else {
+    mdLen = 0;
+  }
+#else
   HMAC_Init_ex(&hmacsha1_ctx, NULL, 0, NULL, NULL);
   HMAC_Update(&hmacsha1_ctx, (void *) &chunk_no, sizeof(uint32_t));
   HMAC_Final(&hmacsha1_ctx, mdResult, &mdLen);
+#endif
+
   memcpy(iv, mdResult, CIPHER_BLOCKSIZE);
 }
 
 void decrypt_chunk(uint8_t *ctext, uint8_t *ptext, uint32_t chunk_no) {
   uint8_t iv[CIPHER_BLOCKSIZE];
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1070
+  size_t datadecoded = 0;
+#endif
 
   compute_iv(chunk_no, iv);
+
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1070
+    CCCrypt(kCCDecrypt, kCCModeCBC, kCCAlgorithmAES128, 0, aes_decrypt_key, CIPHER_KEY_LENGTH, iv, ctext, CHUNK_SIZE, ptext, CHUNK_SIZE, &datadecoded);
+
+    if (datadecoded != CHUNK_SIZE)
+    {
+        fprintf(stderr, "Warning: Decrypted data length != %ull, actually decrypted: %ull\n", (unsigned long long)CHUNK_SIZE, (unsigned long long)datadecoded));
+    }
+#else
   AES_cbc_encrypt(ctext, ptext, CHUNK_SIZE, &aes_decrypt_key, iv, AES_DECRYPT);
+#endif
 }
 
 /* DES3-EDE unwrap operation loosely based on to RFC 2630, section 12.6
    wrapped_key has to be 40 bytes in length.  */
 int apple_des3_ede_unwrap_key(uint8_t *wrapped_key, int wrapped_key_len, uint8_t *decryptKey, uint8_t *unwrapped_key) {
-  EVP_CIPHER_CTX ctx;
   uint8_t *TEMP1, *TEMP2, *CEKICV;
   uint8_t IV[8] = { 0x4a, 0xdd, 0xa2, 0x2c, 0x79, 0xe8, 0x21, 0x05 };
-  int outlen, tmplen, i;
+  int tmplen;
+  int i;
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1070
+  CCCryptorRef ctx;
+  size_t outlen = 0;
+#else
+  int outlen;
+  EVP_CIPHER_CTX ctx;
+#endif
 
-  EVP_CIPHER_CTX_init(&ctx);
   /* result of the decryption operation shouldn't be bigger than ciphertext */
   TEMP1 = malloc(wrapped_key_len);
   TEMP2 = malloc(wrapped_key_len);
   CEKICV = malloc(wrapped_key_len);
-  /* uses PKCS#7 padding for symmetric key operations by default */
+
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1070
+  if (CCCryptorCreate(kCCDecrypt, kCCModeCBC, kCCAlgorithm3DES, decryptKey, 24, IV, &ctx) != kCCSuccess)
+  {
+    fprintf(stderr, "internal error (1) during key unwrap operation!\n");
+    return(-1);
+  }
+
+  if (CCCryptorUpdate(ctx, wrapped_key, wrapped_key_len, TEMP1, wrapped_key_len, &outlen) != kCCSuccess)
+  {
+    fprintf(stderr, "internal error (2) during key unwrap operation!\n");
+    return(-1);
+  }
+
+  if (outlen != wrapped_key_len)
+  {
+    fprintf(stderr, "WARNING: Output key length %ull is not %ull\n", (unsigned long long)outlen, (unsigned long long)wrapped_key_len);
+  }
+
+  if (CCCryptorFinal(ctx, TEMP1 + outlen, wrapped_key_len, &tmplen) != kCCSuccess)
+  {
+    fprintf(stderr, "internal error (3) during key unwrap operation!\n");
+    return(-1);
+  }
+
+  if (tmplen != wrapped_key_len)
+  {
+    fprintf(stderr, "WARNING: Temp key length %ull is not %ull\n", (unsigned long long)outlen, (unsigned long long)wrapped_key_len);
+  }
+
+  outlen += tmplen;
+
+  CCCryptorRelease(ctx);
+
+  for(i = 0; i < outlen; i++) TEMP2[i] = TEMP1[outlen - i - 1];
+
+  if (CCCryptorCreate(kCCDecrypt, kCCModeCBC, kCCAlgorithm3DES, decryptKey, 24, IV, &ctx) != kCCSuccess)
+  {
+    fprintf(stderr, "internal error (1) during key unwrap operation!\n");
+    return(-1);
+  }
+    
+  if (CCCryptorUpdate(ctx, TEMP2+8, wrapped_key_len-8, CEKICV, wrapped_key_len-8, &outlen) != kCCSuccess)
+  {
+    fprintf(stderr, "internal error (2) during key unwrap operation!\n");
+    return(-1);
+  }
+    
+  if (outlen != (wrapped_key_len-8))
+  {
+    fprintf(stderr, "WARNING: Output key length %ull is not %ull\n", (unsigned long long)outlen, (unsigned long long)wrapped_key_len);
+  }
+    
+  if (CCCryptorFinal(ctx, CEKICV + outlen, wrapped_key_len, &tmplen) != kCCSuccess)
+  {
+    fprintf(stderr, "internal error (3) during key unwrap operation!\n");
+    return(-1);
+  }
+    
+  if (tmplen != wrapped_key_len)
+  {
+    fprintf(stderr, "WARNING: Temp key length %ull is not %ull\n", (unsigned long long)outlen, (unsigned long long)wrapped_key_len);
+  }
+
+  CCCryptorRelease(ctx);
+#else
+  EVP_CIPHER_CTX_init(&ctx);
+
+    /* uses PKCS#7 padding for symmetric key operations by default */
   EVP_DecryptInit_ex(&ctx, EVP_des_ede3_cbc(), NULL, decryptKey, IV);
 
   if(!EVP_DecryptUpdate(&ctx, TEMP1, &outlen, wrapped_key, wrapped_key_len)) {
@@ -257,6 +371,7 @@ int apple_des3_ede_unwrap_key(uint8_t *wrapped_key, int wrapped_key_len, uint8_t
 
   outlen += tmplen;
   EVP_CIPHER_CTX_cleanup(&ctx);
+#endif
 
   memcpy(unwrapped_key, CEKICV+4, outlen-4);
   free(TEMP1);
